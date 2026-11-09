@@ -28,7 +28,7 @@ class PhotoFrameApp(App):
 
     def build(self):
 
-        self.title = "Photo Frame"
+        self.title = "Photocraft"
 
         self.frames = []
         self.selected = set()
@@ -46,7 +46,7 @@ class PhotoFrameApp(App):
         # HEADER
 
         root.add_widget(Label(
-            text="[b]PHOTO FRAME[/b]",
+            text="[b]PHOTOCRAFT[/b]",
             markup=True,
             font_size="26sp",
             color=(1, 1, 1, 1),
