@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhotoFrame AI</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #101522;
+            color: white;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: auto;
+        }
+
+        h1 {
+            text-align: center;
+            color: #55d6ff;
+        }
+
+        .card {
+            background: #1c2638;
+            padding: 20px;
+            border-radius: 15px;
+            margin-top: 20px;
+        }
+
+        input, button {
+            width: 100%;
+            padding: 13px;
+            margin-top: 12px;
+            border-radius: 8px;
+            border: none;
+            font-size: 16px;
+        }
+
+        button {
+            background: #00aaff;
+            color: white;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+        }
+
+        #status {
+            margin-top: 15px;
+            color: #80eaff;
+            text-align: center;
+        }
+
+        #gallery {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            margin-top: 20px;
+        }
+
+        .frame {
+            background: #29364c;
+            padding: 8px;
+            border-radius: 10px;
+        }
+
+        .frame img {
+            width: 100%;
+            border-radius: 7px;
+        }
+
+        .frame label {
+            display: block;
+            padding: 8px 0;
+        }
+
+        @media (min-width: 600px) {
+            #gallery {
+                grid-template-columns: repeat(4, 1fr);
+            }
+        }
+    </style>
+</head>
+
+<body>
+<div class="container">
+
+    <h1>📸 PhotoFrame AI</h1>
+    <p style="text-align:center">
+        Extract beautiful photos from your videos.
+    </p>
+
+    <div class="card">
+
+        <h3>1. Upload Video</h3>
+
+        <input type="file" id="video" accept="video/*">
+
+        <h3>2. Frame Interval</h3>
+
+        <select id="interval">
+            <option value="1">Every 1 second</option>
+            <option value="0.5">Every 0.5 second</option>
+            <option value="0.25">Every 0.25 second</option>
+            <option value="2">Every 2 seconds</option>
+            <option value="5">Every 5 seconds</option>
+        </select>
+
+        <button id="extract" onclick="extractFrames()">
+            Extract Frames
+        </button>
+
+        <div id="status"></div>
+
+    </div>
+
+    <div class="card">
+
+        <h3>3. Select Your Best Frames</h3>
+
+        <button onclick="selectAll()">Select All</button>
+
+        <div id="gallery"></div>
+
+        <button onclick="downloadSelected()">
+            Download Selected Photos
+        </button>
+
+    </div>
+
+</div>
+
+<script>
+
+let frames = [];
+
+async function extractFrames() {
+
+    const file = document.getElementById("video").files[0];
+
+    if (!file) {
+        alert("Please select a video first.");
+        return;
+    }
+
+    const button = document.getElementById("extract");
+    const status = document.getElementById("status");
+
+    button.disabled = true;
+    status.innerText = "Uploading video and extracting frames...";
+
+    const formData = new FormData();
+
+    formData.append("video", file);
+    formData.append(
+        "interval",
+        document.getElementById("interval").value
+    );
+
+    try {
+
+        const response = await fetch("/extract", {
+            method: "POST",
+            body: formData
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || "Extraction failed");
+        }
+
+        frames = data.frames || [];
+
+        const gallery = document.getElementById("gallery");
+        gallery.innerHTML = "";
+
+        frames.forEach((frame, index) => {
+
+            const div = document.createElement("div");
+            div.className = "frame";
+
+            const img = document.createElement("img");
+            img.src = frame.url;
+            img.alt = "Frame " + (index + 1);
+
+            const label = document.createElement("label");
+
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.className = "frame-check";
+            checkbox.value = frame.filename;
+            checkbox.checked = true;
+            checkbox.style.width = "auto";
+
+            label.appendChild(checkbox);
+            label.append(" Select frame " + (index + 1));
+
+            div.appendChild(img);
+            div.appendChild(label);
+
+            gallery.appendChild(div);
+
+        });
+
+        status.innerText =
+            "Completed! " + frames.length + " frames extracted.";
+
+    } catch (error) {
+
+        status.innerText = "Error: " + error.message;
+
+    } finally {
+
+        button.disabled = false;
+
+    }
+}
+
+function selectAll() {
+
+    document.querySelectorAll(".frame-check").forEach(box => {
+        box.checked = true;
+    });
+
+}
+
+async function downloadSelected() {
+
+    const selected = Array.from(
+        document.querySelectorAll(".frame-check:checked")
+    ).map(box => box.value);
+
+    if (selected.length === 0) {
+        alert("Please select at least one frame.");
+        return;
+    }
+
+    const response = await fetch("/download", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+            filenames: selected
+        })
+    });
+
+    if (!response.ok) {
+        alert("Download failed.");
+        return;
+    }
+
+    const blob = await response.blob();
+
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "PhotoFrame_Selected.zip";
+    a.click();
+
+    URL.revokeObjectURL(url);
+
+}
+
+</script>
+
+</body>
+  </html>
