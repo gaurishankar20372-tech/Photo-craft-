@@ -1,545 +1,218 @@
 import os
-import shutil
+import subprocess
+import uuid
+import zipfile
 
-from kivy.app import App
-from kivy.clock import Clock
-from kivy.metrics import dp
-from kivy.core.window import Window
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.gridlayout import GridLayout
-from kivy.uix.scrollview import ScrollView
-from kivy.uix.button import Button
-from kivy.uix.label import Label
-from kivy.uix.image import Image
-from kivy.uix.video import Video
-from kivy.uix.popup import Popup
-from kivy.uix.filechooser import FileChooserListView
+from pathlib import Path
+from flask import Flask, render_template, request, jsonify, send_file, abort
+from werkzeug.utils import secure_filename
 
+app = Flask(__name__)
 
-Window.clearcolor = (0.04, 0.04, 0.09, 1)
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 
-PURPLE = (0.48, 0.25, 0.95, 1)
-DARK = (0.10, 0.10, 0.17, 1)
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp/photoframe"))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-SAVE_DIR = "/storage/emulated/0/Pictures/PhotoFrame"
+ALLOWED = {
+    ".mp4", ".mov", ".mkv",
+    ".avi", ".webm", ".3gp"
+}
 
 
-class PhotoFrameApp(App):
+def job_dir(job_id):
+    try:
+        uuid.UUID(job_id)
+    except Exception:
+        abort(404)
 
-    def build(self):
+    folder = DATA_DIR / job_id
 
-        self.title = "Photocraft"
+    if not folder.exists():
+        abort(404)
 
-        self.frames = []
-        self.selected = set()
-        self.buttons = []
-        self.video_duration = 0
-        self.extract_time = 0
-        self.extracting = False
+    return folder
 
-        root = BoxLayout(
-            orientation="vertical",
-            padding=dp(12),
-            spacing=dp(9)
+
+@app.route("/")
+def home():
+    return render_template("index.html")
+
+
+@app.route("/api/extract", methods=["POST"])
+def extract():
+
+    uploaded = request.files.get("video")
+
+    if not uploaded or not uploaded.filename:
+        return jsonify(error="Please choose a video file."), 400
+
+    suffix = Path(
+        secure_filename(uploaded.filename)
+    ).suffix.lower()
+
+    if suffix not in ALLOWED:
+        return jsonify(error="Unsupported video format."), 400
+
+    try:
+        interval = float(
+            request.form.get("interval", "1")
         )
+    except ValueError:
+        return jsonify(error="Invalid frame interval."), 400
 
-        # HEADER
+    if not 0.2 <= interval <= 60:
+        return jsonify(error="Interval must be between 0.2 and 60 seconds."), 400
 
-        root.add_widget(Label(
-            text="[b]PHOTOCRAFT[/b]",
-            markup=True,
-            font_size="26sp",
-            color=(1, 1, 1, 1),
-            size_hint_y=None,
-            height=dp(45)
-        ))
+    job_id = str(uuid.uuid4())
 
-        root.add_widget(Label(
-            text="VIDEO TO IMAGE EXTRACTOR",
-            color=(0.7, 0.6, 1, 1),
-            size_hint_y=None,
-            height=dp(25)
-        ))
+    folder = DATA_DIR / job_id
+    frames_dir = folder / "frames"
 
-        # VIDEO PREVIEW
+    frames_dir.mkdir(parents=True)
 
-        self.video = Video(
-            source="",
-            state="stop",
-            options={"eos": "stop"},
-            allow_stretch=True,
-            keep_ratio=True,
-            size_hint_y=None,
-            height=dp(190)
+    source = folder / ("source" + suffix)
+
+    uploaded.save(source)
+
+    fps = 1.0 / interval
+
+    output_pattern = str(
+        frames_dir / "frame_%05d.jpg"
+    )
+
+    command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(source),
+        "-vf", f"fps={fps:.8f}",
+        "-q:v", "2",
+        output_pattern
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=900
         )
+    except subprocess.TimeoutExpired:
+        return jsonify(error="Video processing timed out. Try a shorter video."), 408
+    finally:
+        source.unlink(missing_ok=True)
 
-        root.add_widget(self.video)
+    if result.returncode != 0:
+        return jsonify(
+            error="Could not process this video. Try another video."
+        ), 422
 
-        # VIDEO BUTTONS
+    extracted = sorted(
+        frames_dir.glob("frame_*.jpg")
+    )
 
-        controls = BoxLayout(
-            size_hint_y=None,
-            height=dp(48),
-            spacing=dp(7)
-        )
+    if not extracted:
+        return jsonify(
+            error="No frames were extracted."
+        ), 422
 
-        upload = self.make_button("UPLOAD VIDEO")
-        upload.bind(on_press=self.open_picker)
+    frames = []
 
-        play = self.make_button("PLAY")
-        play.bind(on_press=self.play_video)
+    for index, path in enumerate(extracted):
 
-        pause = self.make_button("PAUSE")
-        pause.bind(on_press=self.pause_video)
+        frames.append({
+            "name": path.name,
+            "url": f"/media/{job_id}/{path.name}",
+            "time": round(index * interval, 3)
+        })
 
-        controls.add_widget(upload)
-        controls.add_widget(play)
-        controls.add_widget(pause)
+    return jsonify(
+        job_id=job_id,
+        frames=frames,
+        count=len(frames)
+    )
 
-        root.add_widget(controls)
 
-        # EXTRACT BUTTON
+@app.route("/media/<job_id>/<filename>")
+def media(job_id, filename):
 
-        extract = self.make_button(
-            "EXTRACT FRAMES",
-            PURPLE
-        )
+    if not filename.startswith("frame_") or not filename.endswith(".jpg"):
+        abort(404)
 
-        extract.bind(on_press=self.start_extraction)
+    path = job_dir(job_id) / "frames" / filename
 
-        root.add_widget(extract)
+    if not path.is_file():
+        abort(404)
 
-        # STATUS
+    return send_file(
+        path,
+        mimetype="image/jpeg",
+        conditional=True
+    )
 
-        self.status = Label(
-            text="Choose a video to start",
-            color=(1, 1, 1, 1),
-            size_hint_y=None,
-            height=dp(35)
-        )
 
-        root.add_widget(self.status)
+@app.route("/api/download", methods=["POST"])
+def download():
 
-        # PHOTO GRID
+    data = request.get_json(silent=True) or {}
 
-        scroll = ScrollView()
+    job_id = str(data.get("job_id", ""))
+    names = data.get("frames", [])
 
-        self.grid = GridLayout(
-            cols=3,
-            spacing=dp(7),
-            padding=dp(4),
-            size_hint_y=None
-        )
+    folder = job_dir(job_id) / "frames"
 
-        self.grid.bind(
-            minimum_height=self.grid.setter("height")
-        )
+    valid = []
 
-        scroll.add_widget(self.grid)
-        root.add_widget(scroll)
+    for name in names:
 
-        # BOTTOM BUTTONS
+        if (
+            isinstance(name, str)
+            and name.startswith("frame_")
+            and name.endswith(".jpg")
+        ):
 
-        bottom = BoxLayout(
-            size_hint_y=None,
-            height=dp(50),
-            spacing=dp(7)
-        )
+            path = folder / name
 
-        select = self.make_button("SELECT ALL")
-        select.bind(on_press=self.select_all)
+            if path.is_file():
+                valid.append(path)
 
-        save = self.make_button("SAVE PHOTOS", PURPLE)
-        save.bind(on_press=self.save_selected)
+    if not valid:
+        return jsonify(
+            error="Select at least one frame."
+        ), 400
 
-        bottom.add_widget(select)
-        bottom.add_widget(save)
+    zip_path = job_dir(job_id) / "selected_photos.zip"
 
-        root.add_widget(bottom)
+    with zipfile.ZipFile(
+        zip_path,
+        "w",
+        zipfile.ZIP_DEFLATED
+    ) as archive:
 
-        root.add_widget(Label(
-            text="Developed by MG Shankar Tech",
-            color=(0.6, 0.6, 0.7, 1),
-            font_size="11sp",
-            size_hint_y=None,
-            height=dp(22)
-        ))
-
-        return root
-
-    # BUTTON DESIGN
-
-    def make_button(self, text, color=DARK):
-
-        return Button(
-            text=text,
-            background_normal="",
-            background_color=color,
-            color=(1, 1, 1, 1),
-            bold=True,
-            font_size="12sp"
-        )
-
-    # VIDEO PICKER
-
-    def open_picker(self, instance):
-
-        chooser = FileChooserListView(
-            path="/storage/emulated/0",
-            filters=[
-                "*.mp4",
-                "*.mkv",
-                "*.avi",
-                "*.mov",
-                "*.3gp"
-            ]
-        )
-
-        layout = BoxLayout(
-            orientation="vertical",
-            spacing=dp(7),
-            padding=dp(8)
-        )
-
-        layout.add_widget(chooser)
-
-        buttons = BoxLayout(
-            size_hint_y=None,
-            height=dp(45),
-            spacing=dp(7)
-        )
-
-        choose = self.make_button("OPEN", PURPLE)
-        cancel = self.make_button("CANCEL")
-
-        buttons.add_widget(choose)
-        buttons.add_widget(cancel)
-
-        layout.add_widget(buttons)
-
-        popup = Popup(
-            title="Choose Video",
-            content=layout,
-            size_hint=(0.95, 0.9)
-        )
-
-        choose.bind(
-            on_press=lambda x: self.load_video(
-                chooser, popup
-            )
-        )
-
-        cancel.bind(on_press=popup.dismiss)
-
-        popup.open()
-
-    # LOAD VIDEO
-
-    def load_video(self, chooser, popup):
-
-        if not chooser.selection:
-            self.status.text = "Select a video first"
-            return
-
-        path = chooser.selection[0]
-
-        popup.dismiss()
-
-        self.video.state = "stop"
-        self.video.source = path
-        self.video.seek(0)
-
-        self.frames.clear()
-        self.selected.clear()
-        self.grid.clear_widgets()
-        self.buttons.clear()
-
-        self.status.text = "Loading video..."
-
-        Clock.schedule_once(
-            self.check_video, 3
-        )
-
-    def check_video(self, dt):
-
-        duration = self.video.duration
-
-        if duration and duration > 0:
-
-            self.video_duration = duration
-
-            self.status.text = (
-                f"Video Loaded | {duration:.1f} Seconds"
+        for path in valid:
+            archive.write(
+                path,
+                arcname=path.name
             )
 
-        else:
-
-            self.status.text = (
-                "Video loading failed. Check video format."
-            )
-
-    # PLAY
-
-    def play_video(self, instance):
-
-        self.video.state = "play"
-
-    # PAUSE
-
-    def pause_video(self, instance):
-
-        self.video.state = "pause"
-
-    # START EXTRACTION
-
-    def start_extraction(self, instance):
-
-        if not self.video.source:
-            self.status.text = "Upload a video first"
-            return
-
-        if not self.video.duration:
-            self.status.text = "Video is not ready"
-            return
-
-        self.video.state = "pause"
-
-        self.video_duration = self.video.duration
-        self.extract_time = 0
-        self.frames.clear()
-        self.selected.clear()
-        self.grid.clear_widgets()
-        self.buttons.clear()
-
-        self.extracting = True
-
-        self.status.text = "Extracting frames..."
-
-        self.capture_next(0)
-
-    # CAPTURE FRAME
-
-    def capture_next(self, dt):
-
-        if not self.extracting:
-            return
-
-        if self.extract_time >= self.video_duration:
-
-            self.finish_extraction()
-            return
-
-        self.video.seek(self.extract_time)
-
-        Clock.schedule_once(
-            self.save_texture,
-            0.7
-        )
-
-    def save_texture(self, dt):
-
-        if not self.extracting:
-            return
-
-        texture = self.video.texture
-
-        if texture:
-
-            try:
-
-                folder = os.path.join(
-                    self.user_data_dir,
-                    "frames"
-                )
-
-                os.makedirs(
-                    folder,
-                    exist_ok=True
-                )
-
-                filename = os.path.join(
-                    folder,
-                    f"frame_{self.extract_time}.png"
-                )
-
-                texture.save(
-                    filename,
-                    flipped=True,
-                    fmt="png"
-                )
-
-                self.frames.append({
-                    "path": filename,
-                    "time": self.extract_time
-                })
-
-            except Exception as e:
-
-                self.status.text = str(e)
-                self.finish_extraction()
-                return
-
-        self.status.text = (
-            f"Extracting: {self.extract_time}s"
-        )
-
-        self.extract_time += 1
-
-        Clock.schedule_once(
-            self.capture_next,
-            0.2
-        )
-
-    # FINISH
-
-    def finish_extraction(self):
-
-        self.extracting = False
-
-        self.video.state = "pause"
-
-        self.show_frames()
-
-        self.status.text = (
-            f"Extraction complete: {len(self.frames)} frames"
-        )
-
-    # DISPLAY PHOTOS
-
-    def show_frames(self):
-
-        self.grid.clear_widgets()
-        self.buttons.clear()
-
-        for index, frame in enumerate(self.frames):
-
-            box = BoxLayout(
-                orientation="vertical",
-                size_hint_y=None,
-                height=dp(140),
-                spacing=dp(3)
-            )
-
-            image = Image(
-                source=frame["path"],
-                fit_mode="contain"
-            )
-
-            button = Button(
-                text=f"{frame['time']}s",
-                size_hint_y=None,
-                height=dp(32),
-                background_normal="",
-                background_color=DARK
-            )
-
-            button.bind(
-                on_press=lambda btn, i=index:
-                self.toggle_select(i)
-            )
-
-            box.add_widget(image)
-            box.add_widget(button)
-
-            self.grid.add_widget(box)
-
-            self.buttons.append(button)
-
-    # SELECT
-
-    def toggle_select(self, index):
-
-        if index in self.selected:
-            self.selected.remove(index)
-        else:
-            self.selected.add(index)
-
-        self.update_selection()
-
-    # SELECT ALL
-
-    def select_all(self, instance):
-
-        if len(self.selected) == len(self.frames):
-            self.selected.clear()
-        else:
-            self.selected = set(
-                range(len(self.frames))
-            )
-
-        self.update_selection()
-
-    # UPDATE UI
-
-    def update_selection(self):
-
-        for i, button in enumerate(self.buttons):
-
-            if i in self.selected:
-
-                button.text = "✓ SELECTED"
-                button.background_color = PURPLE
-
-            else:
-
-                button.text = (
-                    f"{self.frames[i]['time']}s"
-                )
-
-                button.background_color = DARK
-
-        self.status.text = (
-            f"{len(self.selected)} Selected"
-        )
-
-    # SAVE PHOTOS
-
-    def save_selected(self, instance):
-
-        if not self.selected:
-
-            self.status.text = "Select photos first"
-            return
-
-        try:
-
-            os.makedirs(
-                SAVE_DIR,
-                exist_ok=True
-            )
-
-            count = 0
-
-            for index in sorted(self.selected):
-
-                frame = self.frames[index]
-
-                filename = (
-                    f"PhotoFrame_{frame['time']}s.png"
-                )
-
-                destination = os.path.join(
-                    SAVE_DIR,
-                    filename
-                )
-
-                shutil.copy2(
-                    frame["path"],
-                    destination
-                )
-
-                count += 1
-
-            self.status.text = (
-                f"{count} Photos Saved Successfully!"
-            )
-
-        except Exception as e:
-
-            self.status.text = (
-                f"Save Error: {e}"
-            )
+    return send_file(
+        zip_path,
+        as_attachment=True,
+        download_name="PhotoFrame_Images.zip"
+    )
+
+
+@app.errorhandler(413)
+def too_large(error):
+    return jsonify(
+        error="Video is too large. Maximum upload size is 500 MB."
+    ), 413
 
 
 if __name__ == "__main__":
-    PhotoFrameApp().run()
+
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )￼Enter
